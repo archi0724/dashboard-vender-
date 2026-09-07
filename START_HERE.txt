@@ -1,0 +1,23 @@
+V3.12 FRESH START - RESET FIX
+==============================
+This package contains no preloaded vendor/company/document/ZIP/history data.
+The first launch starts at 0 / 0 / 0 / 0.
+Upload your own vendor ZIPs from the dashboard to begin.
+
+WINDOWS
+1. Extract this ZIP completely.
+2. Open PowerShell in the extracted folder containing app.py and requirements.txt.
+3. Create/install the environment if needed:
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+4. Start the app:
+   .\.venv\Scripts\python.exe -m streamlit run app.py --server.port 8503
+
+DELETE ALL DATA
+Data & backups > Delete ALL dashboard data
+- Tick the permanent-delete checkbox.
+- Type RESET HISTORY exactly.
+- Click DELETE ALL DATA NOW.
+- Success is shown only after companies, documents, history, backups, uploaded ZIP records and stored file bytes are verified empty.
+
+Clear search only changes the current view; it does not delete saved data.
