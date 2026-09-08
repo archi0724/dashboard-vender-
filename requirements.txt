@@ -1,8 +1,6 @@
-# Streamlit matches the version bundled in the supplied original project.
 streamlit==1.63.0
 pandas==2.2.3
-openpyxl>=3.1.5,<4
+openpyxl==3.1.5
 pypdf==5.9.0
 plotly>=5.24,<7
-# Used only when DATABASE_URL is configured for persistent cloud storage.
 psycopg[binary]>=3.2,<4
