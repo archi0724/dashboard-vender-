@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+from io import BytesIO
 from pathlib import Path
 import time
 
@@ -111,6 +112,45 @@ def show_table(frame: pd.DataFrame):
     st.markdown('<div class="table-scroll">'+markup+'</div>', unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False, max_entries=128)
+def first_page_pdf(payload: bytes) -> bytes | None:
+    """Create a small cached PDF containing only the first page for fast preview."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        source = PdfReader(BytesIO(payload), strict=False)
+        if not source.pages:
+            return None
+        output = BytesIO()
+        writer = PdfWriter()
+        writer.add_page(source.pages[0])
+        writer.write(output)
+        return output.getvalue()
+    except Exception:
+        return None
+
+
+def show_document_preview(filename: str, payload: bytes):
+    """Render a fast preview while keeping the original file available for download."""
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        preview = first_page_pdf(payload)
+        if preview:
+            st.caption("Fast preview: first page. Download the original file for the complete document.")
+            st.pdf(preview)
+        else:
+            st.info("This PDF could not be reduced to a first-page preview. Download the original file to view it.")
+    elif mime.startswith("image/"):
+        st.image(payload, caption=filename, width="stretch")
+    elif mime.startswith("text/") or suffix in {".csv", ".txt", ".log"}:
+        try:
+            st.code(payload.decode("utf-8", errors="replace"), language="text")
+        except Exception:
+            st.info("This text file could not be decoded for inline preview.")
+    else:
+        st.info("Inline preview is not available for this format. Use Download file to open it.")
+
+
 def reset_filters():
     for key in list(st.session_state):
         if key in {"company_search", "status_filter", "company_selection", "last_row_selection"} or str(key).startswith(("export_", "zip_")):
@@ -192,6 +232,8 @@ if pending_page := st.session_state.pop("pending_page", None):
 vendors = store.vendors()
 documents = store.documents()
 upload_archives = store.upload_archives()
+aliases = store.aliases()
+review_queue = store.review_queue()
 checklist = build_checklist(vendors, documents)
 counts = dashboard_counts(vendors, documents)
 view_cleared = bool(st.session_state.get("view_cleared", False))
@@ -231,7 +273,7 @@ if notice := st.session_state.pop("notice", None):
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Total companies", f"{display_counts['companies']:,}", help="Unique saved company names. Handover folders and document counts are excluded.")
 m2.metric("Stored documents", f"{display_counts['stored_files']:,}", help="Available document records. Identical bytes uploaded again for the same company do not increase this count.")
-m3.metric("All 8 types available", f"{display_counts['complete_companies']:,}", help="All eight checklist categories have a classified file; this is not a validity/compliance score.")
+m3.metric(f"All {len(DOCUMENT_TYPES)} types available", f"{display_counts['complete_companies']:,}", help="Every checklist category has a classified file; this is not a validity/compliance score.")
 m4.metric("Needs review", f"{display_counts['review_files']:,}", help="Unassigned, unclassified or unavailable document files.")
 if view_cleared:
     st.info("Dashboard view is cleared, so the summary shows 0. Saved data is still stored. Click **Show saved data** to bring it back, or use **Reset all data** to actually delete the active records.")
@@ -293,7 +335,7 @@ elif page == "Companies & documents":
     st.subheader("Find a company")
     col1, col2 = st.columns([3, 1])
     search = col1.text_input("Search company", placeholder="Type a company name...", key="company_search")
-    status = col2.selectbox("Show", ["All companies", "Missing documents", "All 8 available", "Needs review"], key="status_filter")
+    status = col2.selectbox("Show", ["All companies", "Missing documents", "All types available", "Needs review"], key="status_filter")
     filtered = filter_checklist(checklist, search, status)
     scoped = documents[documents.company_key.isin(filtered.company_key)]
     st.caption(f"Showing {len(filtered)} of {len(checklist)} companies | {int(scoped.available.sum())} stored documents in these results")
@@ -301,7 +343,7 @@ elif page == "Companies & documents":
         st.info("No company matches. Use Clear search to remove filters." if len(checklist) else "Start with Upload documents in the left menu. Your company folders will appear here.")
     else:
         st.markdown("### Yes / No document checklist")
-        view = filtered.drop(columns=["company_key"]).copy()
+        view = filtered.drop(columns=["company_key", "canonical_id"], errors="ignore").copy()
         view.insert(0, "No.", range(1, len(view) + 1))
         view["Completion"] = view["Completion"].map(lambda v: f"{v:.0%}")
         show_table(view)
@@ -309,7 +351,7 @@ elif page == "Companies & documents":
         checklist_dl1, checklist_dl2 = st.columns(2)
         visible_excel_name = export_filename(filtered.iloc[0]["Company Name"], "Checklist", "xlsx") if len(filtered) == 1 else "All_Vendors_Checklist.xlsx"
         visible_csv_name = export_filename(filtered.iloc[0]["Company Name"], "Checklist", "csv") if len(filtered) == 1 else "All_Vendors_Checklist.csv"
-        checklist_dl1.download_button("Download visible checklist - Excel", workbook_bytes(filtered, scoped, True), visible_excel_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", key="visible_excel")
+        checklist_dl1.download_button("Download visible checklist - Excel", workbook_bytes(filtered, scoped, True, aliases), visible_excel_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", key="visible_excel")
         checklist_dl2.download_button("Download visible checklist - CSV", csv_bytes(view), visible_csv_name, "text/csv", width="stretch", key="visible_csv")
         st.divider()
         st.markdown("### Company documents")
@@ -325,9 +367,9 @@ elif page == "Companies & documents":
         with st.container(border=True):
             st.subheader(company)
             row = company_checklist.iloc[0]
-            st.caption(f"{int(company_docs.available.sum())} documents saved | {row['Available']} of 8 document types available | {row['Needs review']} to review")
+            st.caption(f"{int(company_docs.available.sum())} documents saved | {row['Available']} of {len(DOCUMENT_TYPES)} document types available | {row['Needs review']} to review")
             x1,x2 = st.columns(2)
-            x1.download_button("Download company Excel", workbook_bytes(company_checklist, company_docs, True),
+            x1.download_button("Download company Excel", workbook_bytes(company_checklist, company_docs, True, aliases),
                 export_filename(company,"Checklist","xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", key="company_excel")
             if x2.button("Prepare all company documents", disabled=company_docs.empty, width="stretch", key="prepare_company_zip"):
                 with st.spinner("Preparing this company's files..."):
@@ -345,11 +387,23 @@ elif page == "Companies & documents":
                     if rows.empty:
                         st.caption("No file available in this category.")
                     for doc in rows.itertuples(index=False):
-                        st.text(doc.filename)
+                        filename_col, preview_col = st.columns([8.5, 1.5], vertical_alignment="center")
+                        filename_col.text(doc.filename)
                         detail = supporting_category(doc.filename) if not doc.types else doc.method
                         st.caption(f"{detail or 'Needs review'} | {doc.size_bytes / 1024:,.0f} KB")
                         payload = store.read_bytes(doc.id) if doc.available else None
                         if payload is not None:
+                            preview_key = f"preview_{doc.id}"
+                            if preview_col.button("👁", key=preview_key, help="Preview this document before downloading."):
+                                st.session_state["preview_document_id"] = doc.id
+                            if st.session_state.get("preview_document_id") == doc.id:
+                                with st.container(border=True):
+                                    preview_title, close_preview = st.columns([5, 1])
+                                    preview_title.markdown(f"**Preview: {doc.filename}**")
+                                    if close_preview.button("Close", key=f"close_{doc.id}"):
+                                        st.session_state.pop("preview_document_id", None)
+                                        st.rerun()
+                                    show_document_preview(doc.filename, payload)
                             st.download_button("Download file", payload, doc.filename,
                                 mimetypes.guess_type(doc.filename)[0] or "application/octet-stream", key=f"file_{category}_{doc.id}")
                         else:
@@ -369,35 +423,24 @@ elif page == "Uploaded ZIPs":
     if upload_archives.empty:
         st.info("No ZIP upload has been archived yet. Go to Upload documents and save a vendor ZIP.")
     else:
-        all_names = sorted({name for names in upload_archives.company_names for name in list(names)}, key=str.casefold)
-        choices = ["__ALL__"] + upload_archives.id.tolist()
-        labels = {"__ALL__": f"All uploaded ZIPs | {len(all_names)} unique vendor(s)"}
-        labels.update({row.id: f"{row.filename} | {int(row.detected_companies)} vendor(s)" for row in upload_archives.itertuples(index=False)})
-        selected_archive = st.selectbox("Head count view", choices, format_func=labels.get, key="uploaded_zip_selection")
+        unique_vendors = vendors.drop_duplicates("company_key")
+        company_names = unique_vendors.sort_values("company_name", key=lambda s: s.str.casefold()).company_name.tolist()
+        st.metric("Company head count", f"{len(company_names):,}", help="Unique companies currently stored in the dashboard across all uploaded ZIP files.")
+        st.caption(f"One cumulative count across {len(upload_archives)} uploaded ZIP file(s). A company uploaded in multiple ZIPs is counted once.")
 
-        if selected_archive == "__ALL__":
-            st.metric("Vendor head count", f"{len(all_names):,}", help="Unique vendor names across all currently saved uploaded ZIP files.")
-            st.caption(f"Across {len(upload_archives)} saved ZIP file(s). Select one ZIP above to see only that file's head count.")
-            selected_names = all_names
-        else:
-            row = upload_archives[upload_archives.id == selected_archive].iloc[0]
-            selected_names = list(row.company_names)
-            st.metric("Vendor head count", f"{len(selected_names):,}", help="Unique vendor names detected inside the selected ZIP only.")
-            st.caption(f"{row.filename} | {int(row.processed_files)} files read | {round(int(row.size_bytes)/(1024*1024),1)} MB")
-
-        with st.expander(f"Show {len(selected_names)} vendor names"):
-            if selected_names:
-                show_table(pd.DataFrame({"No.": range(1, len(selected_names)+1), "Company Name": selected_names}))
+        with st.expander(f"Show {len(company_names)} company names"):
+            if company_names:
+                show_table(pd.DataFrame({"No.": range(1, len(company_names)+1), "Company Name": company_names}))
             else:
-                st.caption("No company folders were detected in this selection.")
+                st.caption("No companies are currently stored.")
 
         st.markdown("#### Download uploaded ZIP files")
-        st.caption("Each button downloads the same original ZIP file that was uploaded to this dashboard.")
+        st.caption("These are source-archive downloads only; their contents are not used as separate company head counts.")
         for row in upload_archives.itertuples(index=False):
             with st.container(border=True):
                 c1, c2 = st.columns([3.6, 1.4], vertical_alignment="center")
                 c1.markdown(f"**{row.filename}**")
-                c1.caption(f"{int(row.detected_companies)} vendors | {int(row.processed_files)} files read | {round(int(row.size_bytes)/(1024*1024),1)} MB")
+                c1.caption(f"{int(row.processed_files)} files read | {round(int(row.size_bytes)/(1024*1024),1)} MB")
                 payload = store.read_upload_archive(row.id)
                 if payload is not None:
                     c2.download_button(f"Download {row.filename}", payload, row.filename, "application/zip", type="primary", width="stretch", key=f"download_uploaded_zip_{row.id}")
@@ -406,6 +449,10 @@ elif page == "Uploaded ZIPs":
 
 elif page == "Review files":
     st.subheader("Check unclear documents")
+    if not review_queue.empty:
+        st.markdown("### Company match review queue")
+        show_table(review_queue[["detected_name", "possible_company", "canonical_id", "confidence", "evidence", "source", "status"]].rename(columns={"detected_name":"Detected name", "possible_company":"Possible company", "canonical_id":"Company ID", "confidence":"Confidence", "evidence":"Evidence", "source":"Source", "status":"Status"}))
+        st.caption("These records were not automatically merged because the company match was uncertain.")
     st.caption("Recognised supporting certificates stay under Other documents. Only unclear classifications and unavailable files need attention.")
     show_all=st.checkbox("Show all documents for correction")
     queue=documents if show_all else documents[documents.needs_review | ~documents.available]
@@ -508,4 +555,13 @@ else:
         st.code("Any handover vendor/\n  01 - Company A/\n    GST.pdf\n    PAN Card.pdf\n  02 - Company B/\n    ISO.pdf\n    Cancelled Cheque.jpg",language="text")
         st.write("Company folders decide ownership. Handover names and generic section folders are ignored, not appended to company names.")
         st.write("Identical bytes within the same company count once. Different document versions remain separate files. A company counts once even with several documents.")
-        st.caption("Limits: 5,000 entries, 128 MB per document, 1 GB expanded data. Skipped or unreadable files are listed in the upload summary. No OCR or external classifier is used.")
+        st.caption("Limits: 5 GB ZIP upload, 5,000 entries, 128 MB per document, 1 GB expanded data. Skipped or unreadable files are listed in the upload summary. No OCR or external classifier is used.")
+    st.subheader("Company name cleanup")
+    st.caption("Merge existing records such as 'Alpha Ltd', 'alpha ltd.' and 'Alpha   Ltd' into one company. Documents are retained; identical files are combined.")
+    if st.button("Merge duplicate company names", key="merge_duplicate_companies"):
+        try:
+            result = store.merge_duplicate_companies()
+            refresh(f"Merged {result['merged_companies']} duplicate company record(s) and {result['merged_documents']} duplicate document record(s).")
+        except Exception:
+            logging.getLogger(__name__).exception("Duplicate company merge failed")
+            st.error("Duplicate company merge failed. Existing data was not intentionally changed; check storage and retry.")

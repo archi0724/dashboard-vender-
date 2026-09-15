@@ -5,12 +5,18 @@ import math
 import re
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.comments import Comment
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
-from openpyxl.utils import get_column_letter
-from openpyxl.workbook.properties import CalcProperties
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.comments import Comment
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    from openpyxl.utils import get_column_letter
+    from openpyxl.workbook.properties import CalcProperties
+    OPENPYXL_IMPORT_ERROR = None
+except ModuleNotFoundError as error:
+    Workbook = None
+    OPENPYXL_IMPORT_ERROR = error
 
 from vendor_core import DOCUMENT_TYPES, supporting_category
 
@@ -73,14 +79,19 @@ def finish(sheet):
         sheet.row_dimensions[row[0].row].height = height
 
 
-def workbook_bytes(checklist: pd.DataFrame, documents: pd.DataFrame, per_company: bool = False) -> bytes:
+def workbook_bytes(checklist: pd.DataFrame, documents: pd.DataFrame, per_company: bool = False, aliases: pd.DataFrame | None = None) -> bytes:
+    if OPENPYXL_IMPORT_ERROR is not None:
+        raise RuntimeError("Excel export requires the openpyxl package. Add openpyxl to requirements.txt and redeploy the app.") from OPENPYXL_IMPORT_ERROR
     book = Workbook()
     book.calculation = CalcProperties(calcId=191029, fullCalcOnLoad=True)
     sheet = book.active
     sheet.title = "Document Checklist"
     headers = ["Company Name", *DOCUMENT_TYPES, "Available", "Missing", "Completion", "Files", "Needs review"]
+    available_column = 2 + len(DOCUMENT_TYPES)
+    missing_column = available_column + 1
+    completion_column = missing_column + 1
     note = "Yes = an available file is classified to this category. No = no classified file found. This is NOT validity/compliance verification."
-    style_sheet(sheet, headers, [44] + [17] * 8 + [13, 13, 15, 12, 16], (str(checklist.iloc[0]["Company Name"]) + " - DOCUMENT CHECKLIST") if len(checklist)==1 else "VENDOR DOCUMENT CHECKLIST", note)
+    style_sheet(sheet, headers, [44] + [17] * len(DOCUMENT_TYPES) + [13, 13, 15, 12, 16], (str(checklist.iloc[0]["Company Name"]) + " - DOCUMENT CHECKLIST") if len(checklist)==1 else "VENDOR DOCUMENT CHECKLIST", note)
     for r, record in enumerate(checklist.to_dict("records"), 5):
         for c, header in enumerate(headers, 1):
             value = record[header]
@@ -88,9 +99,11 @@ def workbook_bytes(checklist: pd.DataFrame, documents: pd.DataFrame, per_company
                 write_text(sheet.cell(r,c), value)
             else:
                 sheet.cell(r,c, value)
-        sheet.cell(r,10, f'=COUNTIF(B{r}:I{r},"Yes")')
-        sheet.cell(r,11, f'=COLUMNS(B{r}:I{r})-J{r}')
-        sheet.cell(r,12, f'=IFERROR(J{r}/COLUMNS(B{r}:I{r}),0)').number_format = "0%"
+        first_type = get_column_letter(2)
+        last_type = get_column_letter(1 + len(DOCUMENT_TYPES))
+        sheet.cell(r, available_column, f'=COUNTIF({first_type}{r}:{last_type}{r},"Yes")')
+        sheet.cell(r, missing_column, f'=COLUMNS({first_type}{r}:{last_type}{r})-{get_column_letter(available_column)}{r}')
+        sheet.cell(r, completion_column, f'=IFERROR({get_column_letter(available_column)}{r}/COLUMNS({first_type}{r}:{last_type}{r}),0)').number_format = "0%"
         sheet.cell(r,1).comment = Comment("Source: company folder or uploaded vendor master. See Document Register for source paths and classification evidence.", "Vendor Document Desk")
     finish(sheet)
     register = book.create_sheet("Document Register")
@@ -103,6 +116,26 @@ def workbook_bytes(checklist: pd.DataFrame, documents: pd.DataFrame, per_company
         for c, value in enumerate(values,1):
             write_text(register.cell(r,c), value)
     finish(register)
+    master = book.create_sheet("Company Master", 0)
+    master_headers = ["Canonical ID", "Canonical Company Name", "Match Status"]
+    style_sheet(master, master_headers, [18, 52, 24], "COMPANY MASTER", "One canonical row per company. IDs remain stable for future uploads.")
+    for r, record in enumerate(checklist.to_dict("records"), 5):
+        values = [record.get("canonical_id", ""), record["Company Name"], "Confirmed"]
+        for c, value in enumerate(values, 1):
+            write_text(master.cell(r, c), value)
+    finish(master)
+    alias_sheet = book.create_sheet("Alias Mapping", 1)
+    alias_headers = ["Canonical ID", "Canonical Company", "Original / Detected Name", "Source", "Confidence", "Status"]
+    style_sheet(alias_sheet, alias_headers, [18, 42, 42, 42, 14, 24], "COMPANY ALIAS MAPPING", "Aliases are retained for future matching. Uncertain matches are not silently merged.")
+    alias_rows = aliases.to_dict("records") if aliases is not None and not aliases.empty else []
+    canonical_ids = {record["company_key"]: record.get("canonical_id", "") for record in checklist.to_dict("records")}
+    canonical_names = {record["company_key"]: record["Company Name"] for record in checklist.to_dict("records")}
+    for r, alias in enumerate(alias_rows, 5):
+        values = [canonical_ids.get(alias["canonical_key"], ""), canonical_names.get(alias["canonical_key"], ""),
+                  alias["alias_name"], alias["source"], f'{int(alias["confidence"])}%', alias["status"]]
+        for c, value in enumerate(values, 1):
+            write_text(alias_sheet.cell(r, c), value)
+    finish(alias_sheet)
     if per_company:
         names_used = {name.casefold() for name in book.sheetnames}
         for record in checklist.to_dict("records"):
@@ -136,6 +169,8 @@ def workbook_bytes(checklist: pd.DataFrame, documents: pd.DataFrame, per_company
         ["Other files", "Recognised supporting documents appear in the register and company sheet. Only unclear/unavailable files need review. All files are retained."],
         ["Head count", "One row per unique company. Files counts stored document records, not document types. Repeated identical file bytes within one company count once."],
         ["Privacy", "This export may contain sensitive file names. Share only with authorized people."],
+        ["Canonical IDs", "Company Master assigns one stable COMP-### ID per company. Alias Mapping preserves detected names and source context."],
+        ["Uncertain matches", "Possible matches remain separate and should be corrected through Review files after identifying evidence is supplied."],
     ]
     style_sheet(readme,["Item","Definition"],[26,115],"HOW TO READ THIS WORKBOOK","Source: uploaded vendor master and uploaded document files; no external data or third-party classification API.")
     for r, values in enumerate(notes,5):

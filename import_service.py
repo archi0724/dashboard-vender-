@@ -27,11 +27,12 @@ def import_documents(store, uploads, forced_company: str = "", read_pdf_text: bo
                      progress: Callable | None = None) -> ImportResult:
     uploads = list(uploads)
     result = ImportResult(source=", ".join(u.name for u in uploads))
-    names = store.vendors().company_name.tolist()
+    names = store.matching_companies()
     detected = set(discover_folder_companies(uploads)) if not forced_company.strip() else {forced_company.strip()}
     if detected:
         store.upsert_vendors(pd.DataFrame({"company_name": sorted(detected, key=str.casefold)}))
-    names = list(dict.fromkeys(names + list(detected)))
+    for name in detected:
+        names.setdefault(name, name)
     limits = ArchiveLimits()
     try:
         for upload in uploads:
@@ -46,6 +47,8 @@ def import_documents(store, uploads, forced_company: str = "", read_pdf_text: bo
                         progress(result.processed_files, path)
                     try:
                         decision = classify(path, names, content, forced_company, read_pdf_text)
+                        if decision.company_name is None:
+                            store.add_review_item("", source=source, record=path, evidence=decision.reason)
                         added = store.save_document(path, content, decision, source)
                         result.saved_files += int(added)
                         result.duplicate_files += int(not added)
@@ -54,7 +57,7 @@ def import_documents(store, uploads, forced_company: str = "", read_pdf_text: bo
                             detected.add(decision.company_name)
                             archive_detected.add(decision.company_name)
                             if decision.company_name not in names:
-                                names.append(decision.company_name)
+                                names[decision.company_name] = decision.company_name
                     except Exception as error:
                         result.issues.append({"File": path, "Reason": f"Not saved: {type(error).__name__}. Check this file/storage and retry."})
             except Exception as error:

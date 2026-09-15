@@ -16,7 +16,27 @@ from typing import Iterable, Iterator
 
 import pandas as pd
 
-DOCUMENT_TYPES = ["Cancelled Cheque", "GST", "MD", "Udyam", "ASF ISO", "PAN Card", "Form 16", "Aadhar"]
+DOCUMENT_TYPES = ["Cancelled Cheque", "GST", "MD", "Udyam", "ASF ISO", "PAN Card", "Form 16", "Aadhar", "Price", "Catalogue"]
+MASTER_COMPANY_NAMES = (
+    "A.S.F Universal Opthalmic", "A.S.F. UNIVERSAL LLP", "Adequate Electro", "AM SCIENTIFIC", "Amkay Products",
+    "AMX MEDICAL SYSTEMS", "Annai Latex", "Aps Lab Catalogue", "BIOTROL", "Blucia Overseas",
+    "BOMBAIM ESSENTIALS (Osm dudes)", "Bos Medicare surgical", "Cardinal Medical Catalogue", "CARDIO BEATS LLP",
+    "Careray Catalogue", "Cephas", "CK Hygiene", "COLDCHAIN CONTROLS", "DEEPAK INDUSTRY", "Deval Enterprises",
+    "DEVAY", "DIABETIK FOOT CARE", "Global Scientific India", "Global Scientific Lab", "GLOZZY", "GULATI INDUSTRIES",
+    "HANSCURE LIFESCIENCE", "Hanscure Multiple", "HARI OM SURGICAL", "Hari Om Surgicals Catalogue", "HS Medi",
+    "ILLUMIX LED LIGHTNING PRIVATE LIMITED", "KDS Enterprise Kaarya", "KUKU MEDICAL INFRASTRUCTURE CO",
+    "LABGEAR INTERNATIONAL", "Labgear Lab", "Lynor Argon S", "LYNOR HEALTHCARE", "Manish Medi Catalogue",
+    "Manish Medi Innovation Pvt Ltd", "Maxxon Medical", "Medicaid Systems (Advance Medicaid) Catalogue", "MEDIKOP",
+    "Meditrax Equipments", "Medsky (A-Sky)", "Medwin India", "MONARCPLUS MANUFACTURERS PRIVATE LIMITED",
+    "OPHTHALMIC SOLUTION", "Opxica Industries", "Osm dudes Catalogue", "Paramount Furniture",
+    "Paramount Hospital Furniture & Equipments", "Paras Enterprises", "Polar Automation", "RAI MEDICAL EQUIPMENTS",
+    "Rastogi Catalogue", "RASTOGI STEEL FURNITURE", "Reliance Instruments", "Resuscitations", "Rohilla Industries Furniture",
+    "Safe & Fresh Products", "Sai Lab Catalogue", "SAILAB EQUIPMENT", "SARVAGYA", "Shree Gopinath (SMK)",
+    "Shri Gurukrupa", "Smk Meditech Disposable", "Sparsh Solutions", "SS HOSPITAL CARE", "Sumit Surgical",
+    "Sumit Surgicals", "Sunfox", "Supreme Surgical (Patel)", "TECHNOCARE MEDISYSTEMS", "TNT Physio", "TRI-X",
+    "UNITECH VISION", "VAMIKA SALES AGENCIES", "Ventibeats Critical Care Catalogue", "VENTIBEATS MEDICAL LLP",
+    "Walnut Catalogue", "WALNUT MEDICAL", "Zetrica Laser",
+)
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".txt"}
 GENERIC_FOLDERS = {
     "document", "documents", "doc", "docs", "file", "files", "upload", "uploads",
@@ -37,9 +57,11 @@ PATTERNS = {
     "PAN Card": r"\bpan\b|pan\s*card\b|\bpermanent\s+account\s+number\b",
     "Form 16": r"\bform\s*[-_ ]*16\b(?!\s*a\b)",
     "Aadhar": r"\b(?:aadhar|aadhaar|adhaar|aad har|adhar)\b|(?:aadhar|aadhaar|adhaar|adhar)\s*card\b",
+    "Price": r"\b(?:price|pricing|pricelist|price\s*list|rate\s*list|rate\s*card)\b",
+    "Catalogue": r"\b(?:catalogue|catalog|product\s+catalog(?:ue)?)\b",
 }
 SUPPORTING_ONLY = re.compile(
-    r"\b(?:incorporation|startup|company\s+registration|ce|fda|lut|challan|invoice|brochure|catalogue|catalog|quotation)\b"
+    r"\b(?:incorporation|startup|company\s+registration|ce|fda|lut|challan|invoice|brochure|quotation)\b"
     r"|certificateofincorporation|\backnowledgement\b", re.I
 )
 
@@ -132,13 +154,62 @@ class Decision:
         return self.company_name is None or (not self.document_types and self.method != "Supporting document")
 
 
+LEGAL_WORDS = {
+    "pvt": "private", "pvtltd": "private limited", "ltd": "limited",
+    "llc": "limited", "inc": "incorporated", "corp": "corporation",
+    "co": "company",
+}
+
+
+def company_core_words(value: str) -> tuple[str, ...]:
+    words = normalize(value).split()
+    expanded = []
+    for word in words:
+        expanded.extend(LEGAL_WORDS.get(word, word).split())
+    while expanded and expanded[-1] in {"private", "limited", "incorporated", "corporation", "company"}:
+        expanded.pop()
+    return tuple(expanded[:6])
+
+
+def known_company_matches(candidate: str, known_names: Iterable[str]) -> list[str]:
+    """Return canonical names that match a candidate without fuzzy merging."""
+    candidate_key = company_key(candidate)
+    if isinstance(known_names, dict):
+        known = {company_key(alias): clean_company(canonical) for alias, canonical in known_names.items() if company_key(alias)}
+    else:
+        known = {company_key(name): clean_company(name) for name in known_names if company_key(name)}
+    if candidate_key in known:
+        return [known[candidate_key]]
+    candidate_words = company_core_words(candidate)
+    matches = []
+    for key, name in known.items():
+        known_words = company_core_words(name)
+        shared = 0
+        for left, right in zip(candidate_words, known_words):
+            if left != right:
+                break
+            shared += 1
+        if shared and (len(candidate_words) == 1 or len(known_words) == 1 or shared >= 2):
+            matches.append(name)
+    return sorted(set(matches), key=str.casefold)
+
+
+def match_known_company(candidate: str, known_names: Iterable[str]) -> str | None:
+    """Resolve a unique case-insensitive shared-initial company alias."""
+    matches = known_company_matches(candidate, known_names)
+    return matches[0] if len(matches) == 1 else None
+
+
 def infer_company(path: str, known_names: Iterable[str] = (), forced_company: str = "") -> tuple[str | None, str, str]:
     if forced_company.strip():
         return clean_company(forced_company), "Selected company", ""
     parts = path_parts(path)
     parents = parts[:-1]
     wrappers: list[str] = []
-    known = {company_key(x): x for x in known_names if company_key(x)}
+    if isinstance(known_names, dict):
+        known = {company_key(alias): clean_company(canonical) for alias, canonical in known_names.items() if company_key(alias)}
+    else:
+        known = {company_key(x): x for x in known_names if company_key(x)}
     for folder in parents:
         if is_wrapper(folder):
             wrappers.append(folder)
@@ -147,7 +218,12 @@ def infer_company(path: str, known_names: Iterable[str] = (), forced_company: st
             continue
         candidate = clean_company(folder)
         if candidate and not candidate.isdigit():
-            return known.get(company_key(candidate), candidate), "Company folder", " / ".join(wrappers)
+            matches = known_company_matches(candidate, known.values())
+            if len(matches) == 1:
+                return matches[0], "Company folder matched to canonical name", " / ".join(wrappers)
+            if len(matches) > 1:
+                return None, "Ambiguous company alias", " / ".join(wrappers)
+            return candidate, "Company folder", " / ".join(wrappers)
     # Flat uploads: a known vendor may be matched by a complete name, never a
     # personal suffix such as 'GST - Mr Someone'. More than one match is unsafe.
     stem = file_stem(path)
@@ -199,7 +275,7 @@ def classify(path: str, known_names: Iterable[str] = (), content: bytes | None =
         reason = "Other/supporting document; not counted as a checklist certificate." if supporting else "Document type unclear. File retained; review classification. Scanned content is not OCR-verified."
     if not types and supporting_category(stem):
         method = "Supporting document"
-        reason = f"Recognized {supporting_category(stem)}. Retained outside the eight checklist categories; validity not checked."
+        reason = f"Recognized {supporting_category(stem)}. Retained outside the checklist categories; validity not checked."
     if not company:
         reason = "Company unclear. Put this file inside its company folder, or assign it in Review queue. " + reason
     return Decision(company, tuple(types), method, reason, handover)
@@ -325,7 +401,8 @@ def read_vendor_file(upload) -> pd.DataFrame:
 
 
 def build_checklist(vendors: pd.DataFrame, documents: pd.DataFrame) -> pd.DataFrame:
-    columns = ["company_key", "Company Name", *DOCUMENT_TYPES, "Available", "Missing", "Completion", "Files", "Needs review"]
+    id_column = ["canonical_id"] if "canonical_id" in vendors.columns else []
+    columns = ["company_key", *id_column, "Company Name", *DOCUMENT_TYPES, "Available", "Missing", "Completion", "Files", "Needs review"]
     if vendors.empty:
         return pd.DataFrame(columns=columns)
     grouped = {key: group for key, group in documents.groupby("company_key")} if not documents.empty else {}
@@ -341,10 +418,13 @@ def build_checklist(vendors: pd.DataFrame, documents: pd.DataFrame) -> pd.DataFr
                 if document.needs_review or not document.available:
                     review += 1
         found = len(present.intersection(DOCUMENT_TYPES))
-        rows.append({"company_key": vendor.company_key, "Company Name": vendor.company_name,
+        row = {"company_key": vendor.company_key, "Company Name": vendor.company_name,
                      **{t: "Yes" if t in present else "No" for t in DOCUMENT_TYPES},
                      "Available": found, "Missing": len(DOCUMENT_TYPES) - found, "Completion": found / len(DOCUMENT_TYPES),
-                     "Files": len(group) if group is not None else 0, "Needs review": review})
+                     "Files": len(group) if group is not None else 0, "Needs review": review}
+        if "canonical_id" in vendors.columns:
+            row["canonical_id"] = vendor.canonical_id
+        rows.append(row)
     return pd.DataFrame(rows, columns=columns).sort_values("Company Name", key=lambda s: s.str.casefold()).reset_index(drop=True)
 
 
@@ -354,7 +434,7 @@ def filter_checklist(checklist: pd.DataFrame, search: str = "", status: str = "A
         frame = frame[frame["Company Name"].str.contains(search.strip(), case=False, regex=False, na=False)]
     if status == "Missing documents":
         frame = frame[frame["Missing"] > 0]
-    elif status == "All 8 available":
+    elif status == "All types available":
         frame = frame[frame["Missing"] == 0]
     elif status == "Needs review":
         frame = frame[frame["Needs review"] > 0]

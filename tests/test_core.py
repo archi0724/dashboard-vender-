@@ -43,6 +43,8 @@ def test_handover_is_not_company(wrapper):
     ('MD5.pdf',['MD']),('MD-42.pdf',['MD']),('FORM MD-9.pdf',['MD']),('TestLicenseMD13.pdf',['MD']),
     ('ISO13485.pdf',['ASF ISO']),('9001 certificate.pdf',['ASF ISO']),('ISO 13485 MD-205023082615.pdf',['ASF ISO']),
     ('isolator.pdf',[]),('Form_16.pdf',['Form 16']),('Form 16A.pdf',[]),('GST and PAN.pdf',['GST','PAN Card']),
+    ('Price List.xlsx',['Price']),('company-price.jpg',['Price']),('product_catalogue.pdf',['Catalogue']),
+    ('Catalog.xls',['Catalogue']),
 ])
 def test_types(filename,expected):assert types_from_name(filename)==expected
 
@@ -157,6 +159,49 @@ def test_filter_literal_no_stale_match(tmp_path):
     assert filter_checklist(checklist,'not-present').empty
 
 
+def test_duplicate_company_names_collapse_to_one_vendor(tmp_path):
+    store=Store(tmp_path)
+    store.upsert_vendors(pd.DataFrame({'company_name':['Alpha Ltd', 'alpha ltd.', ' Alpha   Ltd ']}))
+    vendors=store.vendors()
+    assert len(vendors)==1
+    assert vendors.iloc[0].company_name=='Alpha Ltd'
+
+
+def test_future_upload_matches_unique_shared_initial_company():
+    assert classify('Global Scientific Lab/GST.pdf', ['Global Scientific India']).company_name == 'Global Scientific India'
+    assert classify('Paramount Hospital/GST.pdf', ['Paramount Furniture', 'Paramount Hospital Furniture & Equipments']).company_name == 'Paramount Hospital Furniture & Equipments'
+    assert classify('Acme Pvt Ltd/GST.pdf', ['ACME PRIVATE LIMITED']).company_name == 'ACME PRIVATE LIMITED'
+
+
+def test_future_upload_flags_ambiguous_shared_initial_company():
+    decision=classify('Acme/GST.pdf', ['Acme Medical', 'Acme Surgical'])
+    assert decision.company_name is None and decision.needs_review
+
+
+def test_merge_duplicate_existing_company_records(tmp_path):
+    store=Store(tmp_path)
+    store.save_document('Alpha Ltd/GST.pdf',b'gst',classify('Alpha Ltd/GST.pdf'))
+    with store.connection() as db:
+        db.execute("INSERT INTO vdd_vendors(company_key,company_name,created_at,updated_at,source) VALUES(?,?,?,?,?)", ('alpha-old','Alpha Ltd.','1','1','legacy'))
+        db.execute("UPDATE vdd_documents SET company_key='alpha-old',company_name='Alpha Ltd.'")
+    result=store.merge_duplicate_companies()
+    assert result['merged_companies']==1
+    assert len(store.vendors())==1
+    assert len(store.documents())==1
+    assert store.documents().iloc[0].company_name=='Alpha Ltd.'
+
+
+def test_merge_named_company_alias(tmp_path):
+    store=Store(tmp_path)
+    store.save_document('A.S.F Universal Opthalmic/GST.pdf',b'gst',classify('A.S.F Universal Opthalmic/GST.pdf'))
+    store.save_document('A.S.F. UNIVERSAL LLP/PAN Card.pdf',b'pan',classify('A.S.F. UNIVERSAL LLP/PAN Card.pdf'))
+    result=store.merge_named_companies('A.S.F Universal Opthalmic', ['A.S.F. UNIVERSAL LLP'])
+    assert result['merged_companies']==1
+    assert len(store.vendors())==1
+    assert len(store.documents())==2
+    assert set(store.documents().company_name)=={'A.S.F Universal Opthalmic'}
+
+
 def test_excel_headers_formulas_and_injection(tmp_path):
     store=Store(tmp_path)
     store.save_document('Alpha/GST.pdf',b'one',classify('Alpha/GST.pdf'))
@@ -165,7 +210,7 @@ def test_excel_headers_formulas_and_injection(tmp_path):
     data=workbook_bytes(checklist,store.documents(),True)
     book=load_workbook(BytesIO(data),data_only=False)
     assert book['Document Checklist']['B4'].value=='Cancelled Cheque'
-    assert book['Document Checklist']['J5'].value=='=COUNTIF(B5:I5,"Yes")'
+    assert book['Document Checklist']['L5'].value=='=COUNTIF(B5:K5,"Yes")'
     assert book['Document Checklist']['A5'].data_type=='s'
     for sheet in book:
         if sheet.title not in {'Document Checklist','Document Register','Read me'}:

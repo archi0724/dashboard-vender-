@@ -1,3 +1,9 @@
+# Current update
+
+- Added Price and Catalogue as company-wise Yes / No checklist categories.
+- Price and Catalogue files are recognized across supported file formats from filenames and document-type folders.
+- Separate ZIP uploads merge into existing normalized company records, and company Excel/ZIP downloads include the newly classified files.
+
 # Version 3.11 - Fresh company start
 
 - Removed all bundled vendor/company/document data, uploaded ZIP archives, history, backups and migration reports from the distribution.

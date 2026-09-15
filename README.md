@@ -26,6 +26,8 @@ Open the Local URL printed by Streamlit (normally http://127.0.0.1:8501). This i
 ## Use the dashboard
 
 - **Upload documents**: select your document ZIP and click Save documents. Leave "Company for loose files only" blank for company-folder ZIPs. Existing records remain saved. The vendor head count updates automatically from unique company names across all saved batches.
+
+ZIP uploads are supported up to 5 GB per upload. The application still limits expanded archive data to 1 GB total, individual documents to 128 MB, and archive entries to 5,000 for safety.
 - **Companies & documents**: search a name, select the company, view the fixed-order categories, and download its Excel. Prepare all company documents, then download the company-named ZIP.
 - **Uploaded ZIPs**: view every unique original ZIP saved by the dashboard, its vendor count, vendor names, file count and upload count, and download the original ZIP again.
 - **Review files**: correct unclear company/type mappings. Use Show all documents for correction to change any classification.
@@ -43,7 +45,11 @@ A file with identical SHA-256 bytes uploaded again for the same company is not a
 
 **Yes means an available file is classified to that category. No means no matching classified file was found. Neither means authenticity, validity, expiry or completeness has been verified.** Classification uses filenames and document-type folders. Optional PDF-heading extraction is available; no OCR or external API is used. Review unclear files and Other documents before concluding a required document was never provided.
 
-The eight original checklist categories are Cancelled Cheque, GST, MD, Udyam, ASF ISO, PAN Card, Form 16, Aadhar. ISO retains its original ASF ISO column name. Supporting records have descriptive labels in the Excel register and company sheets rather than being forced into a wrong category.
+The checklist categories are Cancelled Cheque, GST, MD, Udyam, ASF ISO, PAN Card, Form 16, Aadhar, Price and Catalogue. Price files are recognized from labels such as price list, pricelist, pricing, rate list and rate card. Catalogue files are recognized from catalogue, catalog and product catalog labels. These classifications work for supported PDF, image, Excel, Word, CSV and text files; the filename or document-type folder supplies the label. Supporting records have descriptive labels in the Excel register and company sheets rather than being forced into a wrong category.
+
+Price and Catalogue files uploaded in separate ZIPs are merged by normalized company name. Each company Excel checklist shows Yes or No for both categories, and each company's downloadable ZIP includes all available files grouped under the company and category folders.
+
+Future uploads use a canonical company key across ZIPs, PDFs, folders, spreadsheets, CSVs and supported document files. Matching ignores capitalization, punctuation, spacing and common legal suffixes such as Pvt, Ltd, LLC, Inc and Corp. A unique shared initial/core name is matched to the existing company; ambiguous matches are retained for review instead of being silently merged. Exact duplicate file bytes for one company are skipped.
 
 ## Reset is safe and explicit
 

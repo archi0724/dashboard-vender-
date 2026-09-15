@@ -93,8 +93,8 @@ def test_supporting_documents_visible_in_company_excel(tmp_path):
     frame=build_checklist(store.vendors(),store.documents())
     assert frame.iloc[0].Available==0 and frame.iloc[0]['Needs review']==0
     book=load_workbook(BytesIO(workbook_bytes(frame,store.documents(),True)))
-    assert book['Alpha']['A13'].value=='Incorporation'
-    assert book['Alpha']['C13'].value=='Certificate of Incorporation.pdf'
+    assert book['Alpha']['A15'].value=='Incorporation'
+    assert book['Alpha']['C15'].value=='Certificate of Incorporation.pdf'
 
 
 def test_malicious_backup_is_rejected_before_write(tmp_path):
@@ -134,6 +134,31 @@ def test_vendor_head_count_and_uploaded_zip_archive(tmp_path):
     archives=store.upload_archives()
     assert len(archives)==2
     assert int(archives[archives.filename=='second_vendor_batch.zip'].iloc[0].upload_count)==2
+
+
+def test_price_and_catalogue_merge_across_zip_uploads(tmp_path):
+    first=Upload([
+        ('Batch one/Alpha Ltd/Price List.xlsx',b'price'),
+        ('Batch one/Beta Ltd/product_catalogue.pdf',b'catalogue')])
+    second=Upload([
+        ('Batch two/Alpha Ltd/catalogue.jpg',b'catalogue'),
+        ('Batch two/Beta Ltd/price list.pdf',b'price')])
+    first.name='prices.zip'
+    second.name='catalogues.zip'
+    store=Store(tmp_path)
+    import_documents(store,[first])
+    import_documents(store,[second])
+    checklist=build_checklist(store.vendors(),store.documents())
+    indexed=checklist.set_index('Company Name')
+    assert indexed.loc['Alpha Ltd', 'Price']=='Yes'
+    assert indexed.loc['Alpha Ltd', 'Catalogue']=='Yes'
+    assert indexed.loc['Beta Ltd', 'Price']=='Yes'
+    assert indexed.loc['Beta Ltd', 'Catalogue']=='Yes'
+    book=load_workbook(BytesIO(workbook_bytes(checklist,store.documents())))
+    exported=list(book['Document Checklist'].values)
+    headers=exported[3]
+    assert headers[9:11] == ('Price','Catalogue')
+    assert exported[4][9:11] == ('Yes','Yes')
 
 
 def test_uploaded_zip_archive_is_deleted_by_reset(tmp_path):

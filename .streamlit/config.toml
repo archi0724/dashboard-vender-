@@ -7,7 +7,7 @@ textColor = "#172B3A"
 font = "sans serif"
 
 [server]
-maxUploadSize = 512
+maxUploadSize = 5120
 maxMessageSize = 200
 headless = true
 enableXsrfProtection = true

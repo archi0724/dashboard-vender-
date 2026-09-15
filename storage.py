@@ -77,8 +77,17 @@ class Store:
                 db.execute("SELECT pg_advisory_xact_lock(739182641)")
             db.execute("CREATE TABLE IF NOT EXISTS vdd_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("""CREATE TABLE IF NOT EXISTS vdd_vendors (
-                company_key TEXT PRIMARY KEY, company_name TEXT NOT NULL,
+                company_key TEXT PRIMARY KEY, canonical_id TEXT UNIQUE, company_name TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'auto')""")
+            db.execute("""CREATE TABLE IF NOT EXISTS vdd_company_aliases (
+                alias_key TEXT PRIMARY KEY, canonical_key TEXT NOT NULL, alias_name TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '', confidence INTEGER NOT NULL DEFAULT 100,
+                status TEXT NOT NULL DEFAULT 'Confirmed', created_at TEXT NOT NULL)""")
+            db.execute(f"""CREATE TABLE IF NOT EXISTS vdd_review_queue (
+                id {ident}, detected_name TEXT NOT NULL DEFAULT '', possible_company TEXT NOT NULL DEFAULT '',
+                canonical_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', record TEXT NOT NULL DEFAULT '',
+                confidence INTEGER NOT NULL DEFAULT 0, evidence TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Review Required',
+                created_at TEXT NOT NULL, decision TEXT NOT NULL DEFAULT '')""")
             db.execute(f"""CREATE TABLE IF NOT EXISTS vdd_documents (
                 id {ident}, company_key TEXT NOT NULL DEFAULT '', company_name TEXT NOT NULL DEFAULT '',
                 types_json TEXT NOT NULL DEFAULT '[]', filename TEXT NOT NULL, original_path TEXT NOT NULL,
@@ -95,8 +104,68 @@ class Store:
                 issues_count INTEGER NOT NULL DEFAULT 0, stored_path TEXT NOT NULL DEFAULT '', payload {blob})""")
             db.execute(f"CREATE TABLE IF NOT EXISTS vdd_backups (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload {blob} NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS vdd_audit (event_at TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL)")
+            self._ensure_canonical_ids(db)
+            for row in db.execute("SELECT company_key,company_name FROM vdd_vendors").fetchall():
+                self._record_alias(db, row["company_key"], row["company_name"], "Canonical company master")
         if not self.cloud:
             self.migrate_original()
+
+    def _ensure_canonical_ids(self, db: Query):
+        if self.cloud:
+            columns = {row["column_name"] for row in db.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='vdd_vendors'").fetchall()}
+        else:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(vdd_vendors)").fetchall()}
+        if "canonical_id" not in columns:
+            db.execute("ALTER TABLE vdd_vendors ADD COLUMN canonical_id TEXT")
+        rows = db.execute("SELECT company_key FROM vdd_vendors WHERE canonical_id IS NULL OR canonical_id='' ORDER BY created_at,company_key").fetchall()
+        used = {str(row["canonical_id"]) for row in db.execute("SELECT canonical_id FROM vdd_vendors WHERE canonical_id IS NOT NULL").fetchall()}
+        next_id = max([int(value[5:]) for value in used if value.startswith("COMP-") and value[5:].isdigit()] or [0]) + 1
+        for row in rows:
+            while f"COMP-{next_id:03d}" in used:
+                next_id += 1
+            canonical_id = f"COMP-{next_id:03d}"
+            db.execute("UPDATE vdd_vendors SET canonical_id=? WHERE company_key=?", (canonical_id, row["company_key"]))
+            used.add(canonical_id)
+            next_id += 1
+
+    def _record_alias(self, db: Query, canonical_key: str, alias_name: str, source: str, confidence: int = 100, status: str = "Confirmed"):
+        alias_key = company_key(alias_name)
+        if not alias_key:
+            return
+        db.execute("""INSERT INTO vdd_company_aliases(alias_key,canonical_key,alias_name,source,confidence,status,created_at)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(alias_key) DO UPDATE SET canonical_key=excluded.canonical_key,
+            alias_name=excluded.alias_name,source=excluded.source,confidence=excluded.confidence,status=excluded.status""",
+            (alias_key, canonical_key, clean_company(alias_name), source, int(confidence), status, now()))
+
+    def aliases(self) -> pd.DataFrame:
+        with self.connection() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM vdd_company_aliases ORDER BY lower(alias_name)").fetchall()]
+        return pd.DataFrame(rows, columns=["alias_key", "canonical_key", "alias_name", "source", "confidence", "status", "created_at"])
+
+    def add_review_item(self, detected_name: str, possible_company: str = "", source: str = "", record: str = "", confidence: int = 0, evidence: str = ""):
+        with self.connection() as db:
+            canonical_id = ""
+            if possible_company:
+                row = db.execute("SELECT canonical_id FROM vdd_vendors WHERE company_key=?", (company_key(possible_company),)).fetchone()
+                canonical_id = row["canonical_id"] if row else ""
+            db.execute("""INSERT INTO vdd_review_queue(detected_name,possible_company,canonical_id,source,record,confidence,evidence,created_at)
+                VALUES(?,?,?,?,?,?,?,?)""", (clean_company(detected_name), clean_company(possible_company), canonical_id,
+                source, record, int(confidence), evidence, now()))
+
+    def review_queue(self) -> pd.DataFrame:
+        with self.connection() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM vdd_review_queue ORDER BY created_at DESC").fetchall()]
+        return pd.DataFrame(rows, columns=["id", "detected_name", "possible_company", "canonical_id", "source", "record", "confidence", "evidence", "status", "created_at", "decision"])
+
+    def matching_companies(self) -> dict[str, str]:
+        vendors = self.vendors()
+        mapping = {row.company_name: row.company_name for row in vendors.itertuples(index=False)}
+        aliases = self.aliases()
+        if not aliases.empty:
+            canonical = dict(zip(vendors.company_key, vendors.company_name))
+            mapping.update({row.alias_name: canonical.get(row.canonical_key, row.alias_name) for row in aliases.itertuples(index=False)})
+        return mapping
 
     def _upsert_vendor(self, db: Query, name: str, source: str = "auto") -> str:
         name = clean_company(name)
@@ -104,9 +173,16 @@ class Store:
         if not key:
             raise ValueError("Company name cannot be empty.")
         timestamp = now()
-        db.execute("""INSERT INTO vdd_vendors(company_key, company_name, created_at, updated_at, source)
-            VALUES (?, ?, ?, ?, ?) ON CONFLICT(company_key) DO UPDATE SET updated_at=excluded.updated_at""",
-            (key, name, timestamp, timestamp, source))
+        existing = db.execute("SELECT canonical_id FROM vdd_vendors WHERE company_key=?", (key,)).fetchone()
+        canonical_id = existing["canonical_id"] if existing and existing["canonical_id"] else None
+        if not canonical_id:
+            used = [str(row["canonical_id"]) for row in db.execute("SELECT canonical_id FROM vdd_vendors WHERE canonical_id IS NOT NULL").fetchall()]
+            next_id = max([int(value[5:]) for value in used if value.startswith("COMP-") and value[5:].isdigit()] or [0]) + 1
+            canonical_id = f"COMP-{next_id:03d}"
+        db.execute("""INSERT INTO vdd_vendors(company_key,canonical_id,company_name,created_at,updated_at,source)
+            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(company_key) DO UPDATE SET updated_at=excluded.updated_at""",
+            (key, canonical_id, name, timestamp, timestamp, source))
+        self._record_alias(db, key, name, source)
         return key
 
     def upsert_vendors(self, frame: pd.DataFrame) -> int:
@@ -118,7 +194,102 @@ class Store:
     def vendors(self) -> pd.DataFrame:
         with self.connection() as db:
             rows = [dict(row) for row in db.execute("SELECT * FROM vdd_vendors ORDER BY lower(company_name)").fetchall()]
-        return pd.DataFrame(rows, columns=["company_key", "company_name", "created_at", "updated_at", "source"])
+        return pd.DataFrame(rows, columns=["company_key", "canonical_id", "company_name", "created_at", "updated_at", "source"])
+
+    def merge_duplicate_companies(self) -> dict:
+        """Merge existing vendor rows that normalize to the same company key."""
+        with self.connection() as db:
+            rows = [dict(row) for row in db.execute(
+                "SELECT company_key,company_name,created_at FROM vdd_vendors ORDER BY created_at,company_name"
+            ).fetchall()]
+            groups = {}
+            for row in rows:
+                groups.setdefault(company_key(row["company_name"]), []).append(row)
+
+            merged_companies = 0
+            merged_documents = 0
+            for normalized_key, matches in groups.items():
+                if not normalized_key or not matches:
+                    continue
+                canonical = matches[0]
+                canonical_name = clean_company(canonical["company_name"])
+                canonical_key = canonical["company_key"]
+                for duplicate in matches[1:]:
+                    old_key = duplicate["company_key"]
+                    self._record_alias(db, canonical_key, duplicate["company_name"], "Company merge", 90, "Likely Match")
+                    old_documents = db.execute(
+                        "SELECT * FROM vdd_documents WHERE company_key=? ORDER BY id", (old_key,)
+                    ).fetchall()
+                    for document in old_documents:
+                        existing = db.execute(
+                            "SELECT id,types_json,reviewed FROM vdd_documents WHERE company_key=? AND file_hash=?",
+                            (canonical_key, document["file_hash"]),
+                        ).fetchone()
+                        if existing:
+                            types = list(dict.fromkeys(json.loads(existing["types_json"]) + json.loads(document["types_json"])))
+                            db.execute(
+                                "UPDATE vdd_documents SET types_json=?,reviewed=? WHERE id=?",
+                                (json.dumps(types), max(int(existing["reviewed"]), int(document["reviewed"])), existing["id"]),
+                            )
+                            db.execute("DELETE FROM vdd_documents WHERE id=?", (document["id"],))
+                            merged_documents += 1
+                        else:
+                            db.execute(
+                                "UPDATE vdd_documents SET company_key=?,company_name=? WHERE id=?",
+                                (canonical_key, canonical_name, document["id"]),
+                            )
+                    db.execute("DELETE FROM vdd_vendors WHERE company_key=?", (old_key,))
+                    merged_companies += 1
+                db.execute(
+                    "UPDATE vdd_vendors SET company_name=?,updated_at=? WHERE company_key=?",
+                    (canonical_name, now(), canonical_key),
+                )
+                db.execute(
+                    "UPDATE vdd_documents SET company_name=? WHERE company_key=?",
+                    (canonical_name, canonical_key),
+                )
+            result = {"merged_companies": merged_companies, "merged_documents": merged_documents}
+            if merged_companies or merged_documents:
+                db.execute("INSERT INTO vdd_audit VALUES(?,?,?)", (now(), "Duplicate companies merged", json.dumps(result)))
+            return result
+
+    def merge_named_companies(self, canonical_name: str, aliases: list[str]) -> dict:
+        """Merge explicitly confirmed aliases into one canonical company."""
+        canonical_name = clean_company(canonical_name)
+        canonical_key = company_key(canonical_name)
+        alias_keys = {company_key(name) for name in aliases if company_key(name)}
+        alias_keys.discard(canonical_key)
+        with self.connection() as db:
+            rows = [dict(row) for row in db.execute("SELECT company_key,company_name FROM vdd_vendors").fetchall()]
+            matched = {row["company_key"]: row for row in rows if row["company_key"] == canonical_key or row["company_key"] in alias_keys}
+            if canonical_key not in matched:
+                raise ValueError(f"Canonical company not found: {canonical_name}")
+            merged_companies = 0
+            merged_documents = 0
+            for old_key in sorted(set(matched) - {canonical_key}):
+                self._record_alias(db, canonical_key, matched[old_key]["company_name"], "Named company merge", 90, "Likely Match")
+                for document in db.execute("SELECT * FROM vdd_documents WHERE company_key=? ORDER BY id", (old_key,)).fetchall():
+                    existing = db.execute(
+                        "SELECT id,types_json,reviewed FROM vdd_documents WHERE company_key=? AND file_hash=?",
+                        (canonical_key, document["file_hash"]),
+                    ).fetchone()
+                    if existing:
+                        types = list(dict.fromkeys(json.loads(existing["types_json"]) + json.loads(document["types_json"])))
+                        db.execute("UPDATE vdd_documents SET types_json=?,reviewed=? WHERE id=?",
+                                   (json.dumps(types), max(int(existing["reviewed"]), int(document["reviewed"])), existing["id"]))
+                        db.execute("DELETE FROM vdd_documents WHERE id=?", (document["id"],))
+                        merged_documents += 1
+                    else:
+                        db.execute("UPDATE vdd_documents SET company_key=?,company_name=? WHERE id=?",
+                                   (canonical_key, canonical_name, document["id"]))
+                db.execute("DELETE FROM vdd_vendors WHERE company_key=?", (old_key,))
+                merged_companies += 1
+            db.execute("UPDATE vdd_vendors SET company_name=?,updated_at=? WHERE company_key=?",
+                       (canonical_name, now(), canonical_key))
+            db.execute("UPDATE vdd_documents SET company_name=? WHERE company_key=?", (canonical_name, canonical_key))
+            result = {"canonical_name": canonical_name, "merged_companies": merged_companies, "merged_documents": merged_documents}
+            db.execute("INSERT INTO vdd_audit VALUES(?,?,?)", (now(), "Named companies merged", json.dumps(result)))
+            return result
 
     def safe_path(self, path: str) -> Path | None:
         if not path:
@@ -350,7 +521,7 @@ class Store:
         vendors = pd.DataFrame({"company_key": [company_key(company)], "company_name": [company]})
         checklist = build_checklist(vendors, docs)
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(f"{folder}/{export_filename(company, 'Checklist', 'xlsx')}", workbook_bytes(checklist, docs, True))
+            archive.writestr(f"{folder}/{export_filename(company, 'Checklist', 'xlsx')}", workbook_bytes(checklist, docs, True, self.aliases()))
             for doc in docs.sort_values("filename", key=lambda s: s.map(str.casefold)).itertuples(index=False):
                 if doc.available and (payload := self.read_bytes(doc.id)) is not None:
                     category = doc.types[0] if doc.types else "Other documents"
@@ -370,9 +541,10 @@ class Store:
 
     def _snapshot(self, db) -> bytes:
         vendors = [dict(r) for r in db.execute("SELECT * FROM vdd_vendors ORDER BY company_key").fetchall()]
+        aliases = [dict(r) for r in db.execute("SELECT * FROM vdd_company_aliases ORDER BY alias_key").fetchall()]
         documents = [dict(r) for r in db.execute("SELECT * FROM vdd_documents ORDER BY id").fetchall()]
         uploads = [dict(r) for r in db.execute("SELECT * FROM vdd_upload_archives ORDER BY last_uploaded_at").fetchall()]
-        manifest = {"format": "vendor-dashboard-backup-v3", "created_at": now(), "vendors": vendors, "documents": [], "uploads": []}
+        manifest = {"format": "vendor-dashboard-backup-v3", "created_at": now(), "vendors": vendors, "aliases": aliases, "documents": [], "uploads": []}
         out = BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
             written = set()
@@ -467,6 +639,8 @@ class Store:
 
             db.execute("DELETE FROM vdd_documents")
             db.execute("DELETE FROM vdd_vendors")
+            db.execute("DELETE FROM vdd_company_aliases")
+            db.execute("DELETE FROM vdd_review_queue")
             db.execute("DELETE FROM vdd_audit")
             db.execute("DELETE FROM vdd_backups")
             db.execute("DELETE FROM vdd_upload_archives")
@@ -556,6 +730,13 @@ class Store:
                 validated_uploads.append((row, payload, names))
         if manifest["vendors"]:
             self.upsert_vendors(pd.DataFrame(manifest["vendors"]))
+            with self.connection() as db:
+                for row in manifest["vendors"]:
+                    if row.get("canonical_id"):
+                        db.execute("UPDATE vdd_vendors SET canonical_id=? WHERE company_key=?", (row["canonical_id"], row["company_key"]))
+        for row in manifest.get("aliases", []):
+            with self.connection() as db:
+                self._record_alias(db, row["canonical_key"], row["alias_name"], row.get("source", "Backup restore"), int(row.get("confidence", 100)), row.get("status", "Confirmed"))
         restored = duplicates = 0
         for row, payload, types in validated:
             decision = Decision(row["company_name"] or None, tuple(types), row["method"], row["reason"], row.get("handover", ""))
