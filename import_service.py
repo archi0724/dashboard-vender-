@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 import pandas as pd
-from vendor_core import ArchiveLimits, classify, discover_folder_companies, iter_uploads, company_key, clean_company
+from vendor_core import ArchiveLimits, classify, discover_folder_companies, iter_uploads, company_key, clean_company, upload_stream
 
 @dataclass
 class ImportResult:
@@ -17,6 +17,7 @@ class ImportResult:
     total_stored_files: int = 0
     issues: list[dict] = field(default_factory=list)
     company_names: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     upload_archives: list[dict] = field(default_factory=list)
 
     def to_dict(self):
@@ -24,7 +25,7 @@ class ImportResult:
 
 
 def import_documents(store, uploads, forced_company: str = "", read_pdf_text: bool = False,
-                     progress: Callable | None = None) -> ImportResult:
+                     progress: Callable | None = None, retain_archive: bool = True) -> ImportResult:
     uploads = list(uploads)
     result = ImportResult(source=", ".join(u.name for u in uploads))
     names = store.matching_companies()
@@ -61,16 +62,25 @@ def import_documents(store, uploads, forced_company: str = "", read_pdf_text: bo
                     except Exception as error:
                         result.issues.append({"File": path, "Reason": f"Not saved: {type(error).__name__}. Check this file/storage and retry."})
             except Exception as error:
-                result.issues.append({"File": upload.name, "Reason": f"Stopped: {type(error).__name__}. Saved records are retained; retry the upload."})
+                result.issues.append({"File": upload.name, "Reason": f"Stopped: {str(error) if isinstance(error, ValueError) else type(error).__name__}. Saved records are retained; retry the upload."})
             if upload.name.lower().endswith(".zip"):
+                stream = upload_stream(upload)
+                stream.seek(0, 2)
+                archive_size = stream.tell()
+                stream.seek(0)
+                # The existing archive store and download UI both materialize a blob.
+                # Keep large originals at their source rather than allocating GBs.
+                if not retain_archive or archive_size > 32 * 1024 * 1024:
+                    result.notes.append(f"{upload.name}: original ZIP not copied to Uploaded ZIPs. Keep your source ZIP; extracted documents are saved separately.")
+                    continue
                 try:
                     issue_count = max(0, len(result.issues) + len(limits.skipped) - archive_issues_before)
-                    archive_info = store.save_upload_archive(upload.name, upload.getvalue(), sorted(archive_detected, key=str.casefold), archive_processed, issue_count)
+                    archive_info = store.save_upload_archive(upload.name, stream.read(), sorted(archive_detected, key=str.casefold), archive_processed, issue_count)
                     result.upload_archives.append(archive_info)
                 except Exception as error:
                     result.issues.append({"File": upload.name, "Reason": f"Original ZIP archive not saved: {type(error).__name__}. Documents already imported remain saved."})
     except Exception as error:
-        result.issues.append({"File": "Batch", "Reason": f"Stopped: {type(error).__name__}. Saved records are retained; retry the upload."})
+        result.issues.append({"File": "Batch", "Reason": f"Stopped: {str(error) if isinstance(error, ValueError) else type(error).__name__}. Saved records are retained; retry the upload."})
     result.issues.extend(limits.skipped)
     result.company_names = sorted({company_key(n): clean_company(n) for n in detected}.values(), key=str.casefold)
     result.detected_companies = len(result.company_names)

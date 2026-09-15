@@ -17,6 +17,7 @@ import streamlit as st
 
 from exports import csv_bytes, workbook_bytes
 from import_service import import_documents
+from drive_import import download_drive_zip
 from storage import Store
 from vendor_core import (ALLOWED_EXTENSIONS, DOCUMENT_TYPES, build_checklist, dashboard_counts,
                          export_filename, filter_checklist, read_vendor_file, supporting_category)
@@ -283,16 +284,34 @@ else:
 if page == "Upload documents":
     st.subheader("Upload vendor documents")
     st.write("Upload your company-folders ZIP here. The dashboard will detect companies, classify files, update the Yes / No checklist, and keep existing saved records. Exact repeats are skipped.")
-    uploads = st.file_uploader("Choose document ZIP or files", type=["zip"]+sorted(e.lstrip(".") for e in ALLOWED_EXTENSIONS), accept_multiple_files=True, key="document_uploads")
+    source_mode = st.radio("Import source", ["Google Drive ZIP (large files)", "Upload small files"], horizontal=True, key="import_source")
+    drive_link = ""
+    uploads = []
+    if source_mode == "Google Drive ZIP (large files)":
+        drive_link = st.text_input("Google Drive ZIP link", placeholder="https://drive.google.com/file/d/.../view")
+        st.caption("Downloads directly to the server in small chunks, then saves documents one at a time. The link must allow downloads without signing in. Keep the original ZIP in Drive; it will not be copied to Uploaded ZIPs. Transfer speed depends on Drive and your server. Keep this tab open during import.")
+    else:
+        st.caption("For large ZIPs, use Google Drive above. Browser uploads are limited to 64 MB per file; use small batches.")
+        uploads = st.file_uploader("Choose document ZIP or files", type=["zip"]+sorted(e.lstrip(".") for e in ALLOWED_EXTENSIONS), accept_multiple_files=True, key="document_uploads")
     with st.expander("Optional settings"):
         single_company = st.text_input("Company for loose files only", key="loose_company", help="Leave blank for company-folder ZIPs. This assigns every selected file to one company.")
         use_pdf = st.checkbox("Read PDF headings for unclear filenames", value=False, help="Optional local text extraction. No OCR or external service. Scans can still need review.")
         expected = st.number_input("Expected company count (0 = not specified)", min_value=0, value=0, step=1)
-    if st.button("Save documents", key="save_documents", disabled=not uploads, type="primary", width="stretch"):
+    if st.button("Save documents", key="save_documents", disabled=not (uploads or drive_link.strip()), type="primary", width="stretch"):
         progress = st.empty()
         with st.spinner("Reading folders and saving documents..."):
-            result = import_documents(store, uploads, single_company, use_pdf,
-                lambda i,p: progress.caption(f"Saving file {i}: {p.rsplit('/',1)[-1]}"))
+            try:
+                def show_progress(i, path):
+                    if i == 1 or i % 10 == 0:
+                        progress.caption(f"Saving file {i}: {path.rsplit('/', 1)[-1]}")
+                if drive_link.strip():
+                    with download_drive_zip(drive_link, lambda n: progress.caption(f"Downloaded {n / 1024**2:,.0f} MB...")) as downloaded:
+                        result = import_documents(store, [downloaded], single_company, use_pdf, show_progress, retain_archive=False)
+                else:
+                    result = import_documents(store, uploads, single_company, use_pdf, show_progress)
+            except Exception as error:
+                st.error(str(error) if isinstance(error, ValueError) else "Import interrupted. Check the Drive download permission, server disk space and connection, then retry. Previously saved documents remain available.")
+                st.stop()
         progress.empty()
         st.session_state["last_upload"] = result.to_dict()
         st.session_state["expected_count"] = int(expected)
@@ -301,6 +320,8 @@ if page == "Upload documents":
     if not last:
         last = next((e["details"] for e in store.history() if e["action"] == "Document upload"), None)
     if last:
+        for note in last.get("notes", []):
+            st.info(note)
         st.subheader("Last upload summary")
         summary = pd.DataFrame([{
             "Companies in upload": last["detected_companies"], "Total vendor head count": last.get("total_companies", len(vendors)),
@@ -555,7 +576,7 @@ else:
         st.code("Any handover vendor/\n  01 - Company A/\n    GST.pdf\n    PAN Card.pdf\n  02 - Company B/\n    ISO.pdf\n    Cancelled Cheque.jpg",language="text")
         st.write("Company folders decide ownership. Handover names and generic section folders are ignored, not appended to company names.")
         st.write("Identical bytes within the same company count once. Different document versions remain separate files. A company counts once even with several documents.")
-        st.caption("Limits: 5 GB ZIP upload, 5,000 entries, 128 MB per document, 1 GB expanded data. Skipped or unreadable files are listed in the upload summary. No OCR or external classifier is used.")
+        st.caption("Limits: 5 GB Drive ZIP download, 64 MB per browser upload, 5,000 entries, 128 MB per document, 5 GB expanded data. Original ZIPs over 32 MB are kept at their source. Skipped or unreadable files are listed in the upload summary. No OCR or external classifier is used.")
     st.subheader("Company name cleanup")
     st.caption("Merge existing records such as 'Alpha Ltd', 'alpha ltd.' and 'Alpha   Ltd' into one company. Documents are retained; identical files are combined.")
     if st.button("Merge duplicate company names", key="merge_duplicate_companies"):

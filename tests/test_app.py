@@ -20,6 +20,8 @@ def seed(path):
 def app(path):
     at=AppTest.from_file(str(APP),default_timeout=40)
     at.secrets['VENDOR_DATA_DIR']=str(path)
+    at.secrets['APP_PASSWORD']='test-only-password'
+    at.session_state['authenticated']=True
     return at
 
 
@@ -46,6 +48,7 @@ def test_default_search_reset_totals_and_dropdown(tmp_path):
 def test_password_gate_and_empty_state(tmp_path):
     at=app(tmp_path)
     at.secrets['APP_PASSWORD']='unit-test-only-not-a-real-secret'
+    at.session_state['authenticated']=False
     at.run(); assert not at.exception and not at.metric
     at.text_input[0].set_value('unit-test-only-not-a-real-secret')
     at.button[0].click().run()
@@ -68,6 +71,7 @@ def test_upload_duplicate_export_and_navigation(tmp_path):
     with patch('streamlit.file_uploader',side_effect=fake_upload):
         at.run()
         at.radio(key='page').set_value('Upload documents').run()
+        at.radio(key='import_source').set_value('Upload small files').run()
         at.button(key='save_documents').click().run()
         assert not at.exception
         stored=Store(tmp_path)
@@ -106,3 +110,25 @@ def test_reset_requires_confirmation_and_deletes_uploaded_zips(tmp_path):
     assert store.documents().empty and store.vendors().empty
     assert store.history()==[] and store.backup_list()==[]
     assert store.upload_archives().empty
+
+
+def test_drive_import_ui(tmp_path):
+    from contextlib import contextmanager
+    from drive_import import DiskUpload
+    output = BytesIO()
+    with zipfile.ZipFile(output, 'w') as archive:
+        archive.writestr('Batch/Alpha Medical/GST.txt', b'Drive fixture')
+    @contextmanager
+    def fake_download(link, progress):
+        assert link == 'https://drive.google.com/open?id=abcdefghijk'
+        progress(len(output.getvalue()))
+        yield DiskUpload(BytesIO(output.getvalue()))
+    at = app(tmp_path).run()
+    at.radio(key='page').set_value('Upload documents').run()
+    next(t for t in at.text_input if t.label == 'Google Drive ZIP link').set_value('https://drive.google.com/open?id=abcdefghijk').run()
+    with patch('drive_import.download_drive_zip', fake_download):
+        at.button(key='save_documents').click().run()
+    assert not at.exception
+    assert len(Store(tmp_path).documents()) == 1
+    assert Store(tmp_path).upload_archives().empty
+    assert any('original ZIP not copied' in item.value for item in at.info)

@@ -313,7 +313,7 @@ def types_from_pdf(content: bytes) -> list[str]:
 @dataclass
 class ArchiveLimits:
     max_entries: int = 5000
-    max_total_bytes: int = 1024 * 1024 * 1024
+    max_total_bytes: int = 5 * 1024 * 1024 * 1024
     max_file_bytes: int = 128 * 1024 * 1024
     max_nested_bytes: int = 256 * 1024 * 1024
     max_depth: int = 2
@@ -325,7 +325,7 @@ class ArchiveLimits:
 def iter_archive(content: bytes, source: str, limits: ArchiveLimits, prefix: str = "", depth: int = 0) -> Iterator[tuple[str, bytes, str]]:
     if depth > limits.max_depth:
         raise ValueError("ZIP nesting limit exceeded. Upload a company-folder ZIP instead.")
-    with zipfile.ZipFile(BytesIO(content)) as archive:
+    with zipfile.ZipFile(BytesIO(content) if isinstance(content, bytes) else content) as archive:
         for member in sorted(archive.infolist(), key=lambda m: natural_key(m.filename)):
             if member.is_dir():
                 continue
@@ -348,30 +348,43 @@ def iter_archive(content: bytes, source: str, limits: ArchiveLimits, prefix: str
                 limits.skipped.append({"File": member.filename, "Reason": "File too large / unsafe compression ratio"}); continue
             limits.total_bytes += member.file_size
             if limits.total_bytes > limits.max_total_bytes:
-                raise ValueError("Expanded ZIP exceeds 1 GB. Split the upload into smaller batches.")
+                raise ValueError("Expanded ZIP exceeds the configured batch limit. Split the upload into smaller batches.")
             full_path = "/".join(filter(None, (prefix, "/".join(parts))))
             try:
+                if ext == ".zip":
+                    import shutil
+                    import tempfile
+                    with tempfile.TemporaryFile() as nested:
+                        with archive.open(member) as file:
+                            shutil.copyfileobj(file, nested, length=1024 * 1024)
+                        nested.seek(0)
+                        yield from iter_archive(nested, source, limits, full_path[:-4], depth + 1)
+                    continue
                 with archive.open(member) as file:
                     payload = file.read(bound + 1)
                 if len(payload) > bound or not payload:
                     limits.skipped.append({"File": full_path, "Reason": "Empty / oversized file"}); continue
-                if ext == ".zip":
-                    nested_prefix = full_path[:-4]
-                    yield from iter_archive(payload, source, limits, nested_prefix, depth + 1)
-                else:
-                    yield full_path, payload, source
+                yield full_path, payload, source
             except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as exc:
                 limits.skipped.append({"File": full_path, "Reason": f"Unreadable archive entry ({type(exc).__name__})"})
+
+
+def upload_stream(upload):
+    """Use seekable uploads directly; support legacy byte-only callers."""
+    if hasattr(upload, "read") and hasattr(upload, "seek"):
+        upload.seek(0)
+        return upload
+    return BytesIO(upload.getvalue())
 
 
 def iter_uploads(uploads, limits: ArchiveLimits | None = None) -> Iterator[tuple[str, bytes, str]]:
     limits = limits or ArchiveLimits()
     for upload in uploads:
         source = file_basename(upload.name)
-        data = upload.getvalue()
         if source.lower().endswith(".zip"):
-            yield from iter_archive(data, source, limits)
+            yield from iter_archive(upload_stream(upload), source, limits)
         elif PurePosixPath(source).suffix.lower() in ALLOWED_EXTENSIONS:
+            data = upload_stream(upload).read(limits.max_file_bytes + 1)
             limits.entries += 1
             limits.total_bytes += len(data)
             if limits.entries > limits.max_entries or limits.total_bytes > limits.max_total_bytes:
@@ -448,7 +461,7 @@ def discover_folder_companies(uploads) -> list[str]:
         if not upload.name.lower().endswith(".zip"):
             continue
         try:
-            with zipfile.ZipFile(BytesIO(upload.getvalue())) as archive:
+            with zipfile.ZipFile(upload_stream(upload)) as archive:
                 members = archive.infolist()
                 if len(members) > 5000:
                     continue
